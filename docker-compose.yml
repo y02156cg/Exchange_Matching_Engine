@@ -1,0 +1,10 @@
+version: '3'
+
+services:
+  exchange-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "12345:12345"
+    restart: unless-stopped
