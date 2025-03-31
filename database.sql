@@ -9,7 +9,7 @@ CREATE TABLE symbols (
 
 CREATE TABLE positions (
     account_id VARCHAR REFERENCES accounts(account_id),
-    symbol VARCHAR REFERENCES symbos(symbol),
+    symbol VARCHAR REFERENCES symbols(symbol),
     amount DECIMAL NOT NULL CHECK (amount >= 0),
     PRIMARY KEY (account_id, symbol)
 );

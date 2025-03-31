@@ -7,6 +7,7 @@ from psycopg2 import pool # connection pooling, reuse database connections inste
 import time
 import logging
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 
 logging.basicConfig(
     level=logging.INFO,
@@ -18,7 +19,7 @@ DB_CONFIG = {
     'dbname': 'exchange',
     'user': 'postgres',
     'password': 'postgres',
-    'host': 'localhost',
+    'host': 'postgres',
     'port': '5432'
 }
 
@@ -47,9 +48,8 @@ class ExchangeServer:
 
         logger.info(f"Server started on {self.host}:{self.port} with {self.num_workers} workers")
 
-        """Create num_workers process to conduct backend processing"""
         for i in range(self.num_workers):
-            worker = multiprocessing.Process(target=self._woker_process, args=(i,))
+            worker = multiprocessing.Process(target=self._worker_process, args=(i,))
             worker.start()
             self.workers.append(worker)
 
@@ -72,9 +72,15 @@ class ExchangeServer:
     def _handle_client(self, client_socket, address):
         try:
             # Read XML data length
-            length_XML = client_socket.recv(1024).decode().strip() #remove whitespaces, converts bytes into string
-            message_len = int(length_XML)
+            # Read XML length line
+            length_line = b''
+            while b'\n' not in length_line:
+                chunk = client_socket.recv(1)
+                if not chunk:
+                    break
+                length_line += chunk
 
+            message_len = int(length_line.decode().strip())
             received_data = b''
             while len(received_data) < message_len:
                 chunk = client_socket.recv(min(4096, message_len - len(received_data)))
@@ -101,8 +107,8 @@ class ExchangeServer:
 
             if root.tag == 'create':
                 return self._handle_create(root)
-            elif root.tag == 'transaction':
-                return self._handle_transactions(root)
+            elif root.tag == 'transactions':
+                return self._handle_transaction(root)
             else:
                 logger.warning(f"Unknown XML root tag: {root.tag}")
                 return "<results><error>Unknown request type</error></results>"
@@ -122,15 +128,15 @@ class ExchangeServer:
             for child in create_node:
                 if child.tag == 'account':
                     account_id = child.get('id')
-                    balance = child.get('balance')
+                    balance_str = child.get('balance')
 
-                    if not account_id or not balance:
+                    if not account_id or not balance_str:
                         results.append(f'<error id="{account_id}">Missing required attributes</error>')
                         continue
 
                     try:
-                        balance = float(balance)
-                    except ValueError:
+                        balance = Decimal(balance_str)
+                    except (TypeError, InvalidOperation):
                         results.append(f'<error id="{account_id}">Invalid balance value</error>')
                         continue
 
@@ -166,8 +172,8 @@ class ExchangeServer:
                             amount = account_node.text.strip() if account_node.text else "0"
 
                             try:
-                                amount = float(amount)
-                            except ValueError:
+                                amount = Decimal(amount)
+                            except (TypeError, InvalidOperation):
                                 results.append(f'<error sym="{symbol}" id="{account_id}">Invalid amount</error>')
                                 continue
 
@@ -202,7 +208,6 @@ class ExchangeServer:
                                 
     def _handle_transaction(self, transactions_node):
         account_id = transactions_node.get('id')
-
         conn = connection_pool.getconn()
         try:
             with conn.cursor() as cur:
@@ -250,12 +255,13 @@ class ExchangeServer:
         limit_str = order_node.get('limit')
 
         try:
-            amount = float(amount_str)
-            limit_price = float(limit_str)
-        except (ValueError, TypeError):
+            amount = Decimal(amount_str)
+            limit_price = Decimal(limit_str)
+        except (InvalidOperation, TypeError):
             return f'<error sym="{symbol}" amount="{amount_str}" limit="{limit_str}">Invalid amount or limit value</error>'
         
         is_buy = amount > 0
+        abs_amount = abs(amount)
 
         try:
             with conn.cursor() as cur:
@@ -265,25 +271,24 @@ class ExchangeServer:
                     if row is None:
                         return f'<error sym="{symbol}" amount="{amount_str}" limit="{limit_str}">Account not found</error>'
 
-                    balance = row[0]
+                    balance = Decimal(row[0])
                     limit_cost = amount * limit_price
 
                     if balance < limit_cost:
-                        return f'<error sym="{symbol}" amount="{amount_str}" limit={limit_str}">Insufficient funds</error>'
+                        return f'<error sym="{symbol}" amount="{amount_str}" limit="{limit_str}">Insufficient funds</error>'
                     
                     cur.execute(
                         "UPDATE accounts SET balance = balance - %s WHERE account_id = %s",
                         (limit_cost, account_id)
                     )
                 else:
-                    abs_amount = abs(amount)
                     cur.execute(
                         "SELECT amount FROM positions WHERE account_id = %s AND symbol = %s FOR UPDATE",
                         (account_id, symbol)
                     )
                     row = cur.fetchone()
 
-                    if row is None or row[0] < abs_amount:
+                    if row is None or Decimal(row[0]) < abs_amount:
                         return f'<error sym="{symbol}" amount="{amount_str}" limit="{limit_str}">Insufficient shares</error>'
                     
                     cur.execute(
@@ -291,21 +296,21 @@ class ExchangeServer:
                         (abs_amount, account_id, symbol)
                     )
 
-                    cur.execute(
-                        """
-                        INSERT INTO orders (account_id, symbol, amount, limit_price, remaining_amount, status)
-                        VALUES (%s, %s, %s, %s, %s, 'open')
-                        RETURNING order_id
-                        """,
-                        (account_id, symbol, amount, limit_price, abs(amount))
-                    )
+                cur.execute(
+                    """
+                    INSERT INTO orders (account_id, symbol, amount, limit_price, remaining_amount, status, time_created)
+                    VALUES (%s, %s, %s, %s, %s, 'open', NOW())
+                    RETURNING order_id, time_created
+                    """,
+                    (account_id, symbol, amount, limit_price, abs(amount))
+                )
 
-                    order_id = cur.fetchone()[0]
+                order_id, order_time = cur.fetchone()
 
-                    self._match_order(conn, order_id, symbol, amount, limit_price, account_id)
+                self._match_order(conn, order_id, symbol, amount, limit_price, account_id, order_time)
 
-                    conn.commit()
-                    return f'<opened sym="{symbol}" amount="{amount_str}" limit="{limit_str}" id="{order_id}"/>'
+                conn.commit()
+                return f'<opened sym="{symbol}" amount="{amount_str}" limit="{limit_str}" id="{order_id}"/>'
         
         except Exception as e:
             conn.rollback()
@@ -313,7 +318,7 @@ class ExchangeServer:
             return f'<error sym="{symbol}" amount="{amount_str}" limit="{limit_str}">Database error: {e}</error>'
         
 
-    def _match_order(self, conn, order_id, symbol, amount, limit, account_id):
+    def _match_order(self, conn, order_id, symbol, amount, limit, account_id, order_time):
         is_buy = amount > 0
         abs_amount = abs(amount)
         remaining_amount = abs_amount
@@ -347,31 +352,24 @@ class ExchangeServer:
 
                 match_id, match_account, match_amount, match_price, match_remaining, match_time = match
 
-                match_timestamp = match_time
-                # time_created在哪里initialize了？
-                cur.execute("SELECT time_created FROM orders WHERE order_id = %s", (order_id,))
-                order_time = cur.fetchone()[0]
+                execution_price = Decimal(match_price) if match_time < order_time else limit
+                execution_amount = min(remaining_amount, Decimal(match_remaining))
 
-                execution_price = match_price if match_timestamp < order_time else limit
-                execution_amount = min(remaining_amount, match_remaining)
-
-                cur.execuet(
+                cur.execute(
                     """ 
                     INSERT INTO executions (order_id, shares, price, time_executed)
                     VALUES (%s, %s, %s, NOW())
-                    """
+                    """,
                     (order_id, execution_amount, execution_price)
                 )
 
-                cur.execuet(
+                cur.execute(
                     """ 
                     INSERT INTO executions (order_id, shares, price, time_executed)
                     VALUES (%s, %s, %s, NOW())
-                    """
+                    """,
                     (match_id, execution_amount, execution_price)
                 )
-
-                remaining_amount -= execution_amount
 
                 cur.execute(
                     "UPDATE orders SET remaining_amount = remaining_amount - %s WHERE order_id = %s",
@@ -389,55 +387,45 @@ class ExchangeServer:
                 )
 
                 if is_buy:
-                    if execution_price < limit:
-                        refund_amount = execution_amount * (limit - execution_price)
-                        cur.execute(
-                            "UPDATE accounts SET balance = balance + %s WHERE account_id = %s",
-                            (refund_amount, account_id)
-                        )
+                    buyer = account_id
+                    seller = match_account
+                else:
+                    buyer = match_account
+                    seller = account_id
 
-                        seller_credit = execution_amount * execution_price
-                        cur.execute(
-                            "UPDATE accounts SET balance = balance + %s WHERE account_id = %s",
-                            (seller_credit, match_account)
-                        )
-                        
-                        #update original amount adding the external amount and original one
-                        cur.execute(
-                            """
-                            INSERT INTO positions (account_id, symbol, amount)
-                            VALUES (%s, %s, %s)
-                            ON CONFLICT (account_id, symbol)
-                            DO UPDATE SET amount = positions.amount + EXCLUDED.amount 
-                            """,
-                            (account_id, symbol, execution_amount)
-                        )
-                    else:
-                        seller_credit = execution_amount * execution_price
-                        cur.execute(
-                            "UPDATE accounts SET balance = balance + %s WHERE account_id = %s",
-                            (seller_credit, account_id)
-                        )
+                buyer_credit = execution_amount * execution_price
+                cur.execute(
+                    "UPDATE accounts SET balance = balance + %s WHERE account_id = %s",
+                    (buyer_credit, seller)
+                )
 
-                        if match_price > execution_price:
-                            refund_amount = execution_amount * (limit - execution_price)
-                            cur.execute(
-                                "UPDATE accounts SET balance = balance + %s WHERE account_id = %s",
-                                (refund_amount, match_account)
-                            )
+                cur.execute(
+                    """
+                    INSERT INTO positions (account_id, symbol, amount)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (account_id, symbol)
+                    DO UPDATE SET amount = positions.amount + EXCLUDED.amount
+                    """,
+                    (buyer, symbol, execution_amount)
+                )
 
-                        cur.execute(
-                            """
-                            INSERT INTO positions (account_id, symbol, amount)
-                            VALUES (%s, %s, %s)
-                            ON CONFLICT (account_id, symbol)
-                            DO UPDATE SET amount = positions.amount + EXCLUDED.amount 
-                            """,
-                            (match_account, symbol, execution_amount)
-                        )
+                if is_buy and execution_price < limit:
+                    refund = execution_amount * (limit - execution_price)
+                    cur.execute(
+                        "UPDATE accounts SET balance = balance + %s WHERE account_id = %s",
+                        (refund, account_id)
+                    )
+                remaining_amount -= execution_amount
+
+                cur.execute(
+                    "UPDATE orders SET status = CASE WHEN remaining_amount = 0 THEN 'executed' ELSE status END WHERE order_id = %s",
+                    (match_id,)
+                )
+
+            # Final status update for the original order
             cur.execute(
-                 "UPDATE orders SET status = CASE WHEN remaining_amount = 0 THEN 'executed' ELSE status END WHERE order_id = %s",
-                (match_id,)
+                "UPDATE orders SET status = CASE WHEN remaining_amount = 0 THEN 'executed' ELSE status END WHERE order_id = %s",
+                (order_id,)
             )
 
     def _handle_query(self, conn, account_id, query_node):
@@ -490,7 +478,7 @@ class ExchangeServer:
                 executions = cur.fetchall()
                 for shares, price, time_executed in executions:
                     unix_time = int(time_executed.timestamp())
-                    status_xml += f'<executed shares="{shares}" price={price}" time="{unix_time}"/>'
+                    status_xml += f'<executed shares="{shares}" price="{price}" time="{unix_time}"/>'
 
                 status_xml += '</status>'
                 return status_xml
@@ -569,7 +557,7 @@ class ExchangeServer:
                     )
 
                 cancel_xml = f'<canceled id="{trans_id}">'
-                cancel_xml = f'<canceled shares="{remaining}" time="{unix_time}"/>'
+                cancel_xml += f'<canceled shares="{remaining}" time="{unix_time}"/>'
 
                 cur.execute(
                     """
