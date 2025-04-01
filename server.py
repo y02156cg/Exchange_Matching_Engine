@@ -34,40 +34,31 @@ class ExchangeServer:
         self.workers = []
 
     def start(self):
-        global connection_pool #opens a global db connection pool to be used for different modules
+        global connection_pool
         connection_pool = psycopg2.pool.ThreadedConnectionPool(
             minconn=1,
-            maxconn=self.num_workers*2,
+            maxconn=100,
             **DB_CONFIG
         )
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket.bind((self.host, self.port))
-        self.socket.listen(5)
+        self.socket.listen(100)
 
-        logger.info(f"Server started on {self.host}:{self.port} with {self.num_workers} workers")
-
-        for i in range(self.num_workers):
-            worker = multiprocessing.Process(target=self._worker_process, args=(i,))
-            worker.start()
-            self.workers.append(worker)
+        logger.info(f"Server started on {self.host}:{self.port}")
 
         try:
             while True:
-                client_socket, address = self.socket.accept() # continues listen to new clients connection
-                logger.info(f"Connection from {address}")
-                client_handler = threading.Thread(target=self._handle_client, args=(client_socket, address))
-                client_handler.daemon = True #When main program exit, the thread will automatically closed
-                client_handler.start()
+                client_socket, address = self.socket.accept()
+                logger.info(f"Accepted connection from {address}")
+                thread = threading.Thread(target=self._handle_client, args=(client_socket, address), daemon=True)
+                thread.start()
         except KeyboardInterrupt:
-            logger.info("Server shutting down...")
+            logger.info("Shutting down...")
         finally:
             self._cleanup()
 
-    def _worker_process(self, worker_id):
-        """Log worker process to handle client connections"""
-        logger.info(f"Worker {worker_id} started")
 
     def _handle_client(self, client_socket, address):
         try:
@@ -143,14 +134,15 @@ class ExchangeServer:
                     with conn.cursor() as cur:
                         try:
                             cur.execute(
-                                "INSERT INTO accounts (account_id, balance) VALUES (%s, %s)",
+                                "INSERT INTO accounts (account_id, balance) VALUES (%s, %s) ON CONFLICT (account_id) DO NOTHING",
                                 (account_id, balance)
                             )
                             conn.commit()
                             results.append(f'<created id="{account_id}"/>')
-                        except psycopg2.IntegrityError:
+                        except Exception as e:
                             conn.rollback()
-                            results.append(f'<error id="{account_id}">Account already exists</error>')
+                            logger.error(f"Error inserting account {account_id}: {e}")
+                            results.append(f'<error id="{account_id}">Database error</error>')
 
                 elif child.tag == 'symbol':
                     symbol = child.get('sym')
@@ -600,12 +592,3 @@ class ExchangeServer:
 if __name__ == "__main__":
     server = ExchangeServer()
     server.start()
-                        
-
-
-
-
-
-
-
-            

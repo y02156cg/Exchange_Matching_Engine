@@ -51,10 +51,10 @@ class ScalabilityTester:
 
             end_time = time.time()
             return end_time - start_time # get the execution time
-
+        
+        durations = []
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
             future_to_thread = {executor.submit(worker, i): i for i in range(num_threads)} # every thread run worker(i)
-            durations = []
 
             for future in future_to_thread:
                 try:
@@ -83,8 +83,6 @@ class ScalabilityTester:
         self.server_process = subprocess.Popen(cmd, env=env)
         time.sleep(5)  # give server time to start
 
-
-
     def stop_server(self):
         subprocess.run(['docker-compose', 'down'])
 
@@ -92,32 +90,42 @@ class ScalabilityTester:
         cores_to_test = [1, 2, 4]  #Assume a 4-core VM
         num_threads = 20
         requests_per_thread = 50
+        num_runs = 3
         results = []
 
         for cores in cores_to_test:
-            print(f"Assuming server already running with {cores} CPU cores...")
-            time.sleep(5)  # give server time to breathe
+            print(f"Testing with {cores} CPU cores...")
+            per_core_results = []
+            for run in range(num_runs):
+                print(f"Run {run + 1} for {cores} cores...")
+                time.sleep(2)
+                try:
+                    self.setup_data()
+                    result = self.run_load_test(num_threads, requests_per_thread)
+                    per_core_results.append(result)
+                except Exception as e:
+                    print(f"Run {run + 1} for {cores} cores failed: {e}")
 
-            try:
-                self.setup_data()
+            if per_core_results:
+                avg_throughput = statistics.mean(r['requests_per_second'] for r in per_core_results)
+                std_throughput = statistics.stdev(r['requests_per_second'] for r in per_core_results)
+                final_result = per_core_results[0]
+                final_result['requests_per_second'] = avg_throughput
+                final_result['std_throughput'] = std_throughput
+                final_result['cores'] = cores
+                results.append(final_result)
 
-                result = self.run_load_test(num_threads, requests_per_thread)
-                result['cores'] = cores
-                results.append(result)
-
-                print(f"Results for {cores} cores: {result['requests_per_second']:.2f} requests/second")
-
-            except Exception as e:
-                print(f"Test for {cores} cores failed: {e}")
+                print(f"Results for {cores} cores: {avg_throughput:.2f} ± {std_throughput:.2f} req/s")
 
         return results
     
     def generate_plots(self, results):
         cores = [r['cores'] for r in results]
         throughput = [r['requests_per_second'] for r in results]
+        errors = [r.get('std_throughput', 0) for r in results]
 
         plt.figure(figsize=(10, 6))
-        plt.plot(cores, throughput, marker='o', linestyle='-', linewidth=2)
+        plt.errorbar(cores, throughput, yerr=errors, fmt='o-', linewidth=2, capsize=5)
         plt.title('Exchange Server Scalability')
         plt.xlabel('Number of CPU Cores')
         plt.ylabel('Throughput (requests/second)')
@@ -135,7 +143,7 @@ class ScalabilityTester:
         plt.savefig('writeup/scalability_plot.png')
         plt.close()
 
-        speedup = [t / throughput[0] for t in throughput]
+        speedup = [t / base_throughput for t in throughput]
         ideal_speedup = [c for c in cores]
 
         plt.figure(figsize=(10, 6))

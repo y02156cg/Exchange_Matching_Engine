@@ -1,0 +1,8 @@
+Cores: 1
+Requests: 50
+Time: 120.27s
+Throughput: 0.42 req/s
+Avg Duration: 72.30s
+Min Duration: 60.30s
+Max Duration: 120.27s
+
